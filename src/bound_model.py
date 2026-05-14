@@ -9,7 +9,7 @@ import numpy as np
 from typing import Optional, Tuple, List
 from tqdm import tqdm
 
-from bound_ops import (
+from src.bound_ops import (
     ibp_linear, ibp_sigmoid, ibp_swiglu,
     ibp_rmsnorm, ibp_recurrent_step, ibp_conv1d,
     bound_width, margin_from_bounds

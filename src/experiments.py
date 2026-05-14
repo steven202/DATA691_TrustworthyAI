@@ -19,12 +19,12 @@ import mmfreelm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from bound_model import BoundModel
-from bound_ops import (
+from src.bound_model import BoundModel
+from src.bound_ops import (
     ibp_linear, ibp_rmsnorm, ibp_rmsnorm_tight, ibp_sigmoid, ibp_swiglu,
     ibp_recurrent_step, bound_width
 )
-from visualize import (
+from src.visualize import (
     plot_bound_width_vs_epsilon,
     plot_token_uncertainty_heatmap,
     plot_bound_growth_summary,

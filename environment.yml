@@ -1,0 +1,21 @@
+name: uncertainty-verif
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch=2.2.1
+  - pytorch-cuda=12.1
+  - numpy
+  - matplotlib
+  - tqdm
+  - pip
+  - pip:
+    - transformers>=4.41
+    - tokenizers
+    - accelerate
+    - safetensors
+    - einops
+    - ninja
+    - mmfreelm
