@@ -14,7 +14,7 @@
 \title{Certified and Empirical Uncertainty Quantification\\in Matmul-Free Language Models via Bound Propagation}
 \author{%
     Chenan Wang \\
-    DATA 691 -- Trustworthy AI -- Final Project
+    DATA 691: Trustworthy AI, Final Project
 }
 \date{May 2026}
 
@@ -22,12 +22,12 @@
 \maketitle
 
 \begin{abstract}
-Quantifying uncertainty in large language model (LLM) outputs is essential for trustworthy deployment. Formal verification methods such as Interval Bound Propagation (IBP) and CROWN provide \emph{certified} guarantees that model predictions stay within provable bounds under input perturbations. We apply these techniques to MMfreeLM (370M--2.7B parameters), a family of matmul-free recurrent language models that replace dense matrix multiplications with ternary-weight additions. We perturb continuous token embeddings within an $L_\infty$ ball and propagate bounds through the network. We find that certified IBP bounds explode within a single layer---not because of network depth or the ternary weight structure, but because RMSNorm (data-dependent \emph{division}) and multiplicative gating in the recurrence are fundamentally incompatible with interval arithmetic. Sampling-based methods yield finite uncertainty estimates. Comparing MMfreeLM-370M against a standard Transformer baseline (GPT-2 Medium, 355M), we find that the matmul-free architecture exhibits comparable perturbation sensitivity. We implement CROWN linear relaxation for RMSNorm and show it provides up to 500,000$\times$ tighter bounds than certified IBP, demonstrating a practical path toward certified UQ for recurrent LLMs.
+Quantifying uncertainty in large language model (LLM) outputs is essential for trustworthy deployment. Formal verification methods such as Interval Bound Propagation (IBP) and CROWN provide \emph{certified} guarantees that model predictions stay within provable bounds under input perturbations. We apply these techniques to MMfreeLM (370M--2.7B parameters), a family of matmul-free recurrent language models that replace dense matrix multiplications with ternary-weight additions. We perturb continuous token embeddings within an $L_\infty$ ball and propagate bounds through the network. We find that certified IBP bounds explode within a single layer: not because of network depth or the ternary weight structure, but because RMSNorm (data-dependent \emph{division}) and multiplicative gating in the recurrence are fundamentally incompatible with interval arithmetic. Sampling-based methods yield finite uncertainty estimates. Comparing MMfreeLM-370M against a standard Transformer baseline (GPT-2 Medium, 355M), we find that the matmul-free architecture exhibits comparable perturbation sensitivity. We implement CROWN linear relaxation for RMSNorm and show it provides up to 500,000$\times$ tighter bounds than certified IBP, demonstrating a practical path toward certified UQ for recurrent LLMs.
 \end{abstract}
 
 \section{Introduction}
 
-Large language models are increasingly deployed in high-stakes applications, yet their robustness to small input variations remains poorly understood. A model that produces radically different outputs under imperceptible input changes is untrustworthy. Uncertainty quantification (UQ)---measuring output variability under bounded perturbations---is therefore central to trustworthy AI.
+Large language models are increasingly deployed in high-stakes applications, yet their robustness to small input variations remains poorly understood. A model that produces radically different outputs under imperceptible input changes is untrustworthy. Uncertainty quantification (UQ), i.e., measuring output variability under bounded perturbations, is therefore central to trustworthy AI.
 
 Two paradigms exist for UQ under perturbations:
 \begin{enumerate}[label=(\roman*)]
@@ -37,7 +37,9 @@ Two paradigms exist for UQ under perturbations:
 
 We apply both paradigms to MMfreeLM~\cite{zhu2024scalable}, a recently proposed family of language models that replace dense matrix multiplications with ternary weight quantization (BitLinear, using only $\{-1, 0, +1\}$) and self-attention with a gated linear recurrence (MLGRU). This architectural departure from standard Transformers is motivated by practical deployment needs: matrix multiplications dominate both the FLOP and memory cost of Transformer inference, and eliminating them enables efficient deployment on resource-constrained hardware. MMfreeLM models have demonstrated competitive language modeling performance at scales up to 2.7B parameters, and related matmul-free architectures have shown promise for on-device and edge applications~\cite{zhu2023spikegpt}.
 
-However, their robustness properties are entirely unknown. For these models to be trusted in downstream applications, we need to understand how sensitive their outputs are to small input perturbations. There is also an intriguing theoretical question: the term ``matmul-free'' suggests an architecture built primarily from additions and element-wise operations---operations that are, individually, well-behaved under interval arithmetic. If matmul-free models were amenable to certified verification, this would represent a significant advantage over standard Transformers, whose dense attention and MLP matmuls resist tight bound propagation. On the other hand, these models are \textbf{not} purely additive: they contain RMSNorm (division by a data-dependent norm), sigmoid/SwiGLU nonlinearities, and multiplicative gating in the recurrence---operations that can be severely loose under interval bound propagation (IBP).
+Beyond deployment efficiency, there is a structural hypothesis that motivates this study: dense matrix multiplications propagate perturbations broadly, as each output dimension computes a weighted sum over all input dimensions with learned weights that may amplify small changes. In contrast, ternary accumulation ($\{-1, 0, +1\}$) constrains each input dimension's influence, and additive operations do not intrinsically magnify perturbations. We therefore hypothesize that matmul-free models may exhibit intrinsically smaller output variability than standard Transformers under the same input perturbation. This conjecture has not been previously tested and is a central question of the present work.
+
+However, their robustness properties are entirely unknown. For these models to be trusted in downstream applications, we need to understand how sensitive their outputs are to small input perturbations. There is also an intriguing theoretical question: the term ``matmul-free'' suggests an architecture built primarily from additions and element-wise operations, which are individually well-behaved under interval arithmetic. If matmul-free models were amenable to certified verification, this would represent a significant advantage over standard Transformers, whose dense attention and MLP matmuls resist tight bound propagation. However, these models are \textbf{not} purely additive: they contain RMSNorm (division by a data-dependent norm), sigmoid/SwiGLU nonlinearities, and multiplicative gating in the recurrence, all of which can be severely loose under interval bound propagation (IBP).
 
 We study three model sizes (370M, 1.3B, 2.7B parameters) and compare against a standard Transformer baseline (GPT-2 Medium, 355M), asking: \emph{How much does the output distribution shift when token embeddings are perturbed within an $L_\infty$ ball of radius $\varepsilon$?}
 
@@ -66,13 +68,15 @@ with $\boldsymbol{\mu} = (\mathbf{h}^U + \mathbf{h}^L)/2$, $\mathbf{r} = (\mathb
 
 As practical alternatives that work for \emph{any} model architecture without requiring layer-specific bound implementations, we use:
 
-\textbf{Two-pass corner evaluation}: Run the model on the two extreme embeddings $\mathbf{x} - \varepsilon$ and $\mathbf{x} + \varepsilon$, then take element-wise $\min$/$\max$ of the outputs. Fast (2 forward passes) but not certified---for non-monotonic models, the output extremum need not occur at an input extremum.
+\textbf{Two-pass corner evaluation}: Run the model on the two extreme embeddings $\mathbf{x} - \varepsilon$ and $\mathbf{x} + \varepsilon$, then take element-wise $\min$/$\max$ of the outputs. Fast (2 forward passes) but not certified: for non-monotonic models, the output extremum need not occur at an input extremum.
 
 \textbf{Monte Carlo (MC) sampling} ($K{=}50$): Sample $K$ random points uniformly from $\mathcal{B}_\varepsilon(\mathbf{x})$, compute model outputs, and take element-wise extrema:
 \begin{equation}
 f^L \approx \min_{k=1}^K f(\mathbf{x}^{(k)}), \quad f^U \approx \max_{k=1}^K f(\mathbf{x}^{(k)})
 \end{equation}
 These are \textbf{not} certified but approach the true empirical bounds as $K \to \infty$, and are tighter than the two-pass heuristic.
+
+\textbf{Relationship to other methods}. Our MC approach is distinct from both projected gradient descent (PGD) attacks (which search for worst-case adversarial perturbations via gradient ascent) and randomized smoothing (which computes a certified radius by estimating majority-class probability under Gaussian noise). It provides no formal guarantee; it is a purely empirical estimate of output extrema. Certified methods (IBP, CROWN) and empirical methods (MC, two-pass) are complementary: certified methods bound the worst case over \emph{all} perturbations, while empirical methods estimate the typical range under random sampling. We use both to triangulate model behavior, as each reveals different aspects of perturbation sensitivity.
 
 \subsection{Metrics}
 
@@ -98,7 +102,7 @@ These are \textbf{not} certified but approach the true empirical bounds as $K \t
 
 \label{sec:rmsnorm}
 
-A key finding is \emph{why} IBP fails despite MMfreeLM's simplified arithmetic. The model replaces MatMul with ternary accumulation ($\times \{-1,0,1\}$) in BitLinear layers. For these layers, IBP is exact---ternary addition poses no challenge.
+A key finding is \emph{why} IBP fails despite MMfreeLM's simplified arithmetic. The model replaces MatMul with ternary accumulation ($\times \{-1,0,1\}$) in BitLinear layers. For these layers, IBP is exact: ternary addition poses no challenge.
 
 The failure originates from \textbf{RMSNorm}, which normalizes activations via:
 \begin{equation}
@@ -156,7 +160,7 @@ For RMSNorm, CROWN linearizes $x_i/\text{rms}(\mathbf{x})$ around the midpoint, 
 
 The key result is that \textbf{CROWN bounds remain stable at $\sim$10 regardless of the input bound range, while IBP bounds scale linearly.} At the bound ranges encountered after a single model block ($\sim$10$^4$), CROWN provides $\sim$500,000$\times$ tighter bounds. The reason is structural: IBP allows each of the 1024 dimensions to independently minimize its squared value, collapsing the RMS denominator toward $\sqrt{\epsilon} \approx 10^{-3}$, while CROWN linearizes around a fixed midpoint RMS.
 
-\textbf{IBP-CROWN}~\cite{zhang2019towards} uses IBP for fast intermediate-layer pre-activation bounds, then applies CROWN only for the final output bound. \textbf{Beta-CROWN}~\cite{wang2021beta} further tightens bounds via per-neuron split constraints using branch-and-bound. For recurrent LLMs, a full IBP-CROWN implementation requires custom CROWN backward rules for the gated recurrence and SwiGLU activation---our diagonal-Jacobian RMSNorm relaxation demonstrates the approach for the most critical bottleneck. We leave the full end-to-end implementation to future work.
+We implemented an IBP-CROWN hybrid: IBP forward through all layers for intermediate bounds, then CROWN backward through the final normalization and LM head. However, this hybrid produced results nearly identical to tight IBP alone (tightening ratio $\approx$1.0$\times$), because the final layers are linear or near-linear operations where IBP is already tight. In contrast, the standalone CROWN RMSNorm analysis (Table~\ref{tab:crown_ibp}) demonstrates dramatic tightening (up to 500,000$\times$) when CROWN is applied at the earliest normalization layer, where input bound ranges are widest. This reveals an architectural insight: the benefit of CROWN in matmul-free models lies not in the output projection but in bounding the early RMSNorm layers before the recurrence compounds uncertainty. We report the standalone comparison as the primary CROWN result, and note that a full end-to-end CROWN implementation (back-propagating linear bounds through the recurrence and SwiGLU) would extend this benefit across all layers. \textbf{Beta-CROWN}~\cite{wang2021beta} could further tighten bounds via per-neuron split constraints using branch-and-bound.
 
 \subsection{Empirical Uncertainty Estimates}
 
@@ -211,17 +215,17 @@ For IBP to succeed, a model needs a provably small global Lipschitz constant, wh
 
 \subsection{Key Quantitative Findings}
 
-Our experiments reveal a sharp dichotomy between certified and empirical approaches. Certified IBP produces output bounds up to 500,000$\times$ wider than CROWN linear relaxation on a single RMSNorm operation---the RMSNorm denominator collapses toward $\sqrt{\epsilon}$ when input bounds cross zero, while BitLinear layers (ternary accumulation) remain well-behaved. The CROWN diagonal-Jacobian implementation keeps RMSNorm bounds stable at $\sim$10 regardless of input range, yielding tightening ratios from $5\times$ to $5\times 10^5$.
+Our experiments reveal a sharp dichotomy between certified and empirical approaches. Certified IBP produces output bounds up to 500,000$\times$ wider than CROWN linear relaxation on a single RMSNorm operation: the RMSNorm denominator collapses toward $\sqrt{\epsilon}$ when input bounds cross zero, while BitLinear layers (ternary accumulation) remain well-behaved. The CROWN diagonal-Jacobian implementation keeps RMSNorm bounds stable at $\sim$10 regardless of input range, yielding tightening ratios from $5\times$ to $5\times 10^5$.
 
 Monte Carlo sampling provides model-agnostic uncertainty estimates with bound widths of 0.5--10 across $\varepsilon \in [0.001, 0.1]$. Comparing MMfreeLM-370M against GPT-2 Medium (355M), we found that the matmul-free architecture does not fundamentally alter embedding-level robustness: at $\varepsilon{=}0.01$, MC bound widths are 0.89 vs.\ 1.98, with GPT-2 showing higher top-1 stability (0.99 vs.\ 0.59) despite wider bounds. The two-pass corner evaluation systematically underestimates uncertainty by 2--6$\times$ compared to MC, confirming that output extrema do not occur at input extrema for non-monotonic architectures.
 
 \subsection{Limitations}
 
-Our study has several limitations: (1) we perturb embeddings rather than discrete tokens, which is well-defined mathematically but may not correspond to realistic textual perturbations; (2) MC sampling with $K{=}50$ may miss rare extreme outputs accessible to an adversary; (3) our CROWN implementation uses a diagonal Jacobian approximation for RMSNorm---a full CROWN backward pass through the gated recurrence and SwiGLU activation would provide end-to-end certified bounds; (4) the baseline comparison is limited to one model pair (370M vs.\ 355M) and two architectures.
+Our study has several limitations: (1) we perturb embeddings rather than discrete tokens, which is well-defined mathematically but may not correspond to realistic textual perturbations; (2) MC sampling with $K{=}50$ may miss rare extreme outputs accessible to an adversary; (3) our CROWN implementation uses a diagonal Jacobian approximation for RMSNorm: a full CROWN backward pass through the gated recurrence and SwiGLU activation would provide end-to-end certified bounds; (4) the baseline comparison is limited to one model pair (370M vs.\ 355M) and two architectures.
 
 \section{Conclusion}
 
-This work examined whether matmul-free language models admit formal uncertainty quantification through bound propagation. We found that removing matrix multiplications does not make a model more amenable to certified verification---the primary bottleneck is RMSNorm, a division-based normalization that fundamentally conflicts with interval arithmetic. Linear relaxation methods such as CROWN resolve this by bounding the operation around a fixed midpoint, providing a path toward practical certified bounds for recurrent architectures. Empirical Monte Carlo sampling bridges the gap: it provides stable uncertainty estimates across model scales and architectures without requiring specialized certified training. Our open-source framework supports all three approaches and is designed for extension to deeper CROWN backward passes and larger model families.
+This work examined whether matmul-free language models admit formal uncertainty quantification through bound propagation. We found that removing matrix multiplications does not make a model more amenable to certified verification: the primary bottleneck is RMSNorm, a division-based normalization that fundamentally conflicts with interval arithmetic. Linear relaxation methods such as CROWN resolve this by bounding the operation around a fixed midpoint, providing a path toward practical certified bounds for recurrent architectures. Empirical Monte Carlo sampling bridges the gap: it provides stable uncertainty estimates across model scales and architectures without requiring specialized certified training. Our open-source framework supports all three approaches and is designed for extension to deeper CROWN backward passes and larger model families.
 
 \bibliographystyle{plain}
 \bibliography{ref}
