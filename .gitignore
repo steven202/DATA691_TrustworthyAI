@@ -1,15 +1,35 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-.DS_Store
+*.py[cod]
+*.py[co]
+*.egg-info/
+dist/
+*.egg
+
+# LaTeX build artifacts
 *.aux
 *.log
 *.out
 *.fls
 *.fdb_latexmk
 *.synctex.gz
-results/*.json
-results/*.log
+*.blg
+*.bbl
+
+# OS / IDE
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs and temp
 logs/
 *.pth
 *.bin
+texput.log
+
+# Stale results at root level (organized results are in subdirs)
+/results/*.json
+
+# Empty directory
+plots/
