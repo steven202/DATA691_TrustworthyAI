@@ -29,7 +29,7 @@ def crown_rmsnorm_diag(x_l, x_u, weight, eps=1e-6):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output-dir', default='results/crown')
+    parser.add_argument('--output-dir', default='results/crown_rmsnorm')
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

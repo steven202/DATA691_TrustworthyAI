@@ -50,7 +50,7 @@ python -c "import torch; import mmfreelm; import transformers; print('OK')"
     ├── baseline/                      # Baseline comparison (GPT-2 vs MMfreeLM-370M)
     │   ├── baseline_results.json
     │   └── plots/
-    ├── crown/                         # IBP vs CROWN RMSNorm comparison
+    ├── crown_rmsnorm/                 # IBP vs CROWN RMSNorm comparison
     │   └── rmsnorm_comparison.json
     └── full/                          # Full experiment results
         └── plots/
@@ -84,7 +84,7 @@ python src/baseline_comparison.py --output-dir results/baseline --n-samples 50
 ### CROWN vs IBP standalone (single RMSNorm operation)
 
 ```bash
-python src/crown_experiment.py --output-dir results/crown
+python src/crown_experiment.py --output-dir results/crown_rmsnorm
 ```
 
 ## Key Findings
