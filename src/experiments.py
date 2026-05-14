@@ -171,6 +171,28 @@ def run_experiment(bound_model, input_ids, epsilon, n_samples, attention_mask=No
         logger.info(f"  ε={epsilon:.4f} IBP: width={metrics_i['mean_width']:.2e}, "
                     f"layers={len(widths)}")
 
+    # ── IBP-CROWN hybrid (tight IBP + CROWN final layers) ──
+    t0 = time.time()
+    try:
+        ibp_l, ibp_u, crown_l, crown_u = bound_model.ibp_crown_bounds(
+            input_ids, epsilon, attention_mask)
+        metrics_ibp = bound_model.compute_metrics(ibp_l, ibp_u)
+        metrics_crown = bound_model.compute_metrics(crown_l, crown_u)
+        results['ibp_crown_hybrid'] = {
+            'ibp_width': metrics_ibp['mean_width'],
+            'crown_width': metrics_crown['mean_width'],
+            'tightening_ratio': metrics_ibp['mean_width'] / max(metrics_crown['mean_width'], 1e-8),
+            'ibp_top1': metrics_ibp['top1_agreement'],
+            'crown_top1': metrics_crown['top1_agreement'],
+            'time': time.time() - t0,
+        }
+        logger.info(f"  ε={epsilon:.4f} IBP-CROWN: IBP={metrics_ibp['mean_width']:.4f}, "
+                    f"CROWN={metrics_crown['mean_width']:.4f}, "
+                    f"ratio={metrics_ibp['mean_width']/max(metrics_crown['mean_width'],1e-8):.1f}x")
+    except Exception as e:
+        logger.warning(f"  IBP-CROWN failed: {e}")
+        results['ibp_crown_hybrid'] = {'error': str(e)}
+
     # ── Empirical (two-pass) ──
     t0 = time.time()
     try:

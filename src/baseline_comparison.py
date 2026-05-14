@@ -55,6 +55,23 @@ def mc_empirical_bounds(model, input_ids, epsilon, n_samples, attention_mask=Non
     return stacked.min(dim=0).values, stacked.max(dim=0).values
 
 
+@torch.no_grad()
+def two_pass_empirical_bounds(model, input_ids, epsilon, attention_mask=None):
+    """Two-pass corner evaluation: run with emb±ε, take element-wise min/max."""
+    embed_layer = model.get_input_embeddings()
+    emb = embed_layer(input_ids)
+
+    results = []
+    for sign in [-1, 1]:
+        emb_pert = emb + sign * epsilon
+        outputs = model(inputs_embeds=emb_pert, attention_mask=attention_mask)
+        results.append(outputs.logits.cpu())
+
+    lb = torch.min(results[0], results[1])
+    ub = torch.max(results[0], results[1])
+    return lb, ub
+
+
 def compute_metrics(lb, ub):
     width = ub - lb
     mid = (lb + ub) / 2.0
@@ -103,7 +120,14 @@ def main():
                 m = compute_metrics(lb, ub)
                 m['time'] = time.time() - t0
                 pr[f'eps_{eps}'] = {'epsilon': eps, 'mc_empirical': m}
-                logger.info(f'  eps={eps:.3f}: width={m["mean_width"]:.4f}, '
+
+                # Two-pass empirical
+                lb2, ub2 = two_pass_empirical_bounds(model, input_ids, eps, attn)
+                m2 = compute_metrics(lb2, ub2)
+                pr[f'eps_{eps}']['empirical'] = m2
+
+                logger.info(f'  eps={eps:.3f}: MC width={m["mean_width"]:.4f}, '
+                           f'2-pass width={m2["mean_width"]:.4f}, '
                            f'top1={m["top1_agreement"]:.3f}, time={m["time"]:.1f}s')
 
             model_results[f'prompt_{pi}'] = {'text': prompt, 'results': pr}

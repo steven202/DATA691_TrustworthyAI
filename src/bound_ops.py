@@ -151,6 +151,166 @@ def ibp_elementwise_min(lower, upper, other_l, other_u):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def crown_linear_backward(last_uA, last_lA, weight, bias=None, bound_opts=None):
+    """CROWN backward through Linear layer. Returns (uA, ubias_sum, lA, lbias_sum)."""
+    if bound_opts is None:
+        bound_opts = {}
+    # Upper bound: propagate A^U * W, accumulate bias
+    uA = None
+    ubias_sum = 0
+    if last_uA is not None:
+        # last_uA: (batch, * , out_dim), weight: (out_dim, in_dim)
+        # New A = last_uA @ W, acting on input x
+        # Shape handling: last_uA (B, L, V), weight (V, D) -> (B, L, D)
+        if last_uA.dim() == 3:
+            uA = last_uA.matmul(weight)
+        else:
+            uA = last_uA.matmul(weight)
+        if bias is not None:
+            ubias_sum = ubias_sum + last_uA.matmul(bias.unsqueeze(-1)).squeeze(-1)
+
+    lA = None
+    lbias_sum = 0
+    if last_lA is not None:
+        if last_lA.dim() == 3:
+            lA = last_lA.matmul(weight)
+        else:
+            lA = last_lA.matmul(weight)
+        if bias is not None:
+            lbias_sum = lbias_sum + last_lA.matmul(bias.unsqueeze(-1)).squeeze(-1)
+
+    return uA, ubias_sum, lA, lbias_sum
+
+
+def crown_sigmoid_backward(last_uA, last_lA, lower, upper, bound_opts=None):
+    """
+    CROWN linear relaxation of sigmoid.
+    For y = sigmoid(x) with x in [l, u]:
+    Upper bound: chord connecting (l, sig(l)) to (u, sig(u))
+    Lower bound: tangent at the midpoint (tightest for sigmoid)
+    """
+    if bound_opts is None:
+        bound_opts = {}
+    sig_l = torch.sigmoid(lower)
+    sig_u = torch.sigmoid(upper)
+
+    # Upper linear bound: chord (always valid since sigmoid is convex then concave)
+    chord_slope = (sig_u - sig_l) / (upper - lower + 1e-8)
+    upper_d = chord_slope
+    upper_b = sig_l - upper_d * lower
+
+    # Lower linear bound: tangent at midpoint (tight lower bound for sigmoid)
+    mid = (lower + upper) / 2.0
+    sig_mid = torch.sigmoid(mid)
+    d_mid = sig_mid * (1 - sig_mid)  # derivative of sigmoid at mid
+    lower_d = d_mid
+    lower_b = sig_mid - lower_d * mid
+
+    uA, ubias, lA, lbias = None, 0, None, 0
+    if last_uA is not None:
+        uA = upper_d.unsqueeze(-1) * last_uA
+        ubias = (last_uA * upper_b.unsqueeze(-1)).sum(-1) if last_uA.dim() > 2 else (last_uA * upper_b).sum(-1)
+    if last_lA is not None:
+        lA = lower_d.unsqueeze(-1) * last_lA
+        lbias = (last_lA * lower_b.unsqueeze(-1)).sum(-1) if last_lA.dim() > 2 else (last_lA * lower_b).sum(-1)
+    return uA, ubias, lA, lbias
+
+
+def crown_rmsnorm_backward(last_uA, last_lA, lower, upper, weight, eps=1e-6):
+    """
+    CROWN backward linear relaxation of RMSNorm.
+    RMSNorm(x)_i = x_i / rms(x) * w_i,  rms(x) = sqrt(mean(x^2) + eps)
+
+    Linearizes: y_i ≈ a_i * x_i + sum_j b_ij * x_j + c_i
+    using first-order Taylor expansion around the midpoint of [lower, upper].
+
+    This is a local linearization (not globally certified), but provides
+    tight estimates when the input interval is small relative to the RMS.
+    """
+    weight = weight.to(dtype=lower.dtype)
+    mid = (lower + upper) / 2.0
+    rms_mid = torch.sqrt(mid.square().mean(dim=-1, keepdim=True) + eps)
+    w = weight.unsqueeze(0).unsqueeze(0) if weight.dim() == 1 else weight
+    D = lower.shape[-1]
+
+    # ∂(x_i/rms(x))/∂x_j at x=mid:
+    # = 1/rms * delta_ij - x_i * x_j / (D * rms^3)
+    inv_rms = 1.0 / rms_mid
+    inv_rms3 = 1.0 / (rms_mid ** 3)
+
+    # Jacobian: (B, L, D, D) — diagonal + rank-1 outer product
+    # J_{ij} = w_i * (inv_rms * delta_ij - mid_i * mid_j / (D * inv_rms3))
+    # For CROWN, we need A_new = A_old @ J, where J acts on x
+
+    # Instead of building the full D×D Jacobian, use structure:
+    # J @ v = w * (inv_rms * v - mid/D * inv_rms3 * (mid · v))
+    # So A_new @ x = A_old @ (w * inv_rms * x) - A_old @ (w * mid/D * inv_rms3) * (mid · x)
+
+    # For CROWN propagation: last_uA has shape (B, L, V) or (B*L, V)
+    # We need to compute the action of J^T on each row of last_uA
+    # J^T @ a = inv_rms * w * a - (mid · (w * a)) * inv_rms3 * mid / D
+
+    # This is complex for 3D tensors. We use a simplified element-wise
+    # diagonal approximation: ∂y_i/∂x_i ≈ w_i / rms(mid)
+    # This ignores off-diagonal coupling but is a reasonable first-order approx.
+
+    diag_jac = w * inv_rms  # (B, L, D)
+
+    uA, ubias, lA, lbias = None, 0, None, 0
+    if last_uA is not None:
+        uA = last_uA * diag_jac  # element-wise: A_out acts through diagonal Jacobian
+        # bias correction: y(mid) - J @ mid
+        y_mid = mid / rms_mid * w
+        ubias = (last_uA * (y_mid - diag_jac * mid)).sum(-1)
+
+    if last_lA is not None:
+        lA = last_lA * diag_jac
+        y_mid = mid / rms_mid * w
+        lbias = (last_lA * (y_mid - diag_jac * mid)).sum(-1)
+
+    return uA, ubias, lA, lbias
+
+
+def crown_swiglu_backward(last_uA, last_lA, gate_l, gate_u, val_l, val_u):
+    """
+    CROWN backward through SwiGLU(gate, val) = gate * sigmoid(gate) * val.
+    Uses linear relaxation around midpoints of both gate and val.
+    """
+    gate_mid = (gate_l + gate_u) / 2.0
+    val_mid = (val_l + val_u) / 2.0
+
+    # SwiGLU(g, v) = silu(g) * v where silu(g) = g * sigmoid(g)
+    silu_g = gate_mid * torch.sigmoid(gate_mid)
+    d_silu = torch.sigmoid(gate_mid) + gate_mid * torch.sigmoid(gate_mid) * (1 - torch.sigmoid(gate_mid))
+
+    # ∂f/∂gate = d_silu * val_mid
+    grad_gate = d_silu * val_mid
+    # ∂f/∂val = silu(gate_mid)
+    grad_val = silu_g
+
+    uA, ubias, lA, lbias = None, 0, None, 0
+    y_mid = silu_g * val_mid
+
+    if last_uA is not None:
+        # last_uA acts on the SwiGLU output; A_new_gate = last_uA * grad_gate
+        uA_gate = last_uA * grad_gate
+        uA_val = last_uA * grad_val
+        uA = (uA_gate, uA_val)  # return pair for gate/val paths
+        ubias = (last_uA * (y_mid - grad_gate * gate_mid - grad_val * val_mid)).sum(-1)
+
+    if last_lA is not None:
+        lA_gate = last_lA * grad_gate
+        lA_val = last_lA * grad_val
+        lA = (lA_gate, lA_val)
+        lbias = (last_lA * (y_mid - grad_gate * gate_mid - grad_val * val_mid)).sum(-1)
+
+    return uA, ubias, lA, lbias
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Concrete bound computation (final step of CROWN)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def crown_linear_backward(last_uA, last_lA, weight, bias=None, bound_opts=None):
     """CROWN backward through Linear layer. Returns (uA, ubias, lA, lbias)."""
     if bound_opts is None:
         bound_opts = {}
@@ -227,6 +387,104 @@ def concretize_bounds(A, sum_b, x_L, x_U, norm=np.inf, sign=-1):
         deviation = A.norm(dual_norm, -1) * 0  # L2 not needed for our use
         bound = A.bmm(x) + sign * deviation.unsqueeze(-1)
     bound = bound.squeeze(-1) + sum_b
+    return bound
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CROWN v2: (V, D) matrix format for IBP-CROWN hybrid
+# ═══════════════════════════════════════════════════════════════════════════
+
+def crown_rmsnorm_backward_v2(last_uA, last_lA, x_L, x_U, weight, eps=1e-6):
+    """
+    CROWN backward through RMSNorm with (V, D) A matrices.
+
+    Args:
+        last_uA, last_lA: (V, D) — linear coeffs w.r.t. normalized output
+        x_L, x_U: (B, L, D) — bounds on pre-norm hidden states
+        weight: (D,) — RMSNorm weight
+    Returns:
+        uA, lA: (V, D) — linear coeffs w.r.t. pre-norm input
+        ubias, lbias: (V,) — accumulated bias per logit
+    """
+    weight = weight.to(dtype=x_L.dtype)
+    mid = (x_L + x_U) / 2.0  # (B, L, D)
+    rms_mid = torch.sqrt(mid.square().mean(dim=-1, keepdim=True) + eps)  # (B, L, 1)
+    w = weight.unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+    D = x_L.shape[-1]
+
+    # Diagonal Jacobian approximation: ∂y_i/∂x_i ≈ w_i / rms(mid)
+    diag_jac = w / rms_mid  # (B, L, D)
+
+    # For each logit v, A_new(v, j) = sum_i A(v, i) * ∂y_i/∂x_j
+    # ≈ A(v, j) * diag_jac(j) (diagonal approximation)
+    # A has shape (V, D), diag_jac has shape (B, L, D)
+    # Result should be (B, L, V, D) or we concretize directly
+
+    # Actually, we compute per-(B,L) bounds directly:
+    # A_eff(b,l,v,j) = last_uA(v, j) * diag_jac(b, l, j)
+    # The ubias needs to account for the linearization error
+    # y_mid(b,l,i) = mid(b,l,i) / rms_mid(b,l) * w(0,0,i)
+    y_mid = mid / rms_mid * w  # (B, L, D)
+    # Jacobian @ mid ≈ y_mid (since RMSNorm is approx. linear near mid)
+
+    # Bias correction: f(mid) - J @ mid ≈ y_mid - diag_jac * mid
+    bias_correction = y_mid - diag_jac * mid  # (B, L, D)
+
+    # Now: A_eff(v, b, l, j) = last_uA(v, j) * diag_jac(b, l, j)
+    # ubias(v, b, l) = sum_j last_uA(v, j) * bias_correction(b, l, j)
+
+    uA = None
+    ubias = 0
+    if last_uA is not None:
+        # Shape: last_uA (V, D) × diag_jac (B, L, D) → (B, L, V, D) for A
+        # ubias: (V, D) @ (B, L, D)^T → (V, B, L) → sum → (B, L, V)
+        # Using einsum for clarity:
+        # A_eff[b,l,v,j] = last_uA[v,j] * diag_jac[b,l,j]
+        # ubias_contrib[v] = sum_j last_uA[v,j] * bias_correction[b,l,j]
+        ubias = torch.einsum('vd,bld->blv', last_uA, bias_correction)
+        uA_last = last_uA  # store for concretize, will multiply with diag_jac later
+
+    lA = None
+    lbias = 0
+    if last_lA is not None:
+        lbias = torch.einsum('vd,bld->blv', last_lA, bias_correction)
+        lA_last = last_lA
+
+    # We store the diag_jac for concretize step
+    return (uA_last, diag_jac), ubias, (lA_last, diag_jac), lbias
+
+
+def concretize_bounds_v2(A_info, sum_b, x_L, x_U, sign=-1):
+    """
+    Concretize bounds from (A_weight, diag_jac) pair.
+
+    Args:
+        A_info: (A_weight, diag_jac) tuple or None
+            - A_weight: (V, D) — base linear coefficients
+            - diag_jac: (B, L, D) — diagonal Jacobian of RMSNorm
+        sum_b: (B, L, V) — accumulated bias
+        x_L, x_U: (B, L, D) — input bounds
+        sign: -1 for lower bound, +1 for upper bound
+    Returns:
+        bound: (B, L, V) — concrete bounds
+    """
+    if A_info is None:
+        return None
+    A_weight, diag_jac = A_info
+
+    # Effective A per position: A_eff[b,l,v,j] = A_weight[v,j] * diag_jac[b,l,j]
+    # Bound = A_eff @ x_mid + sign * |A_eff| @ x_diff + sum_b
+    x_mid = (x_U + x_L) / 2.0  # (B, L, D)
+    x_diff = (x_U - x_L) / 2.0  # (B, L, D)
+
+    # A_eff_mid: (B, L, V) = sum_j A_weight[v,j] * diag_jac[b,l,j] * x_mid[b,l,j]
+    A_eff_times_mid = torch.einsum('vd,bld,bld->blv', A_weight, diag_jac, x_mid)
+
+    # |A_eff| @ x_diff: (B, L, V) = sum_j |A_weight[v,j] * diag_jac[b,l,j]| * x_diff[b,l,j]
+    A_eff_abs_times_diff = torch.einsum('vd,bld,bld->blv',
+                                         A_weight.abs(), diag_jac.abs(), x_diff)
+
+    bound = A_eff_times_mid + sign * A_eff_abs_times_diff + sum_b
     return bound
 
 

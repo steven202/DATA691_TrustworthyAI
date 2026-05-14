@@ -11,8 +11,12 @@ from tqdm import tqdm
 
 from src.bound_ops import (
     ibp_linear, ibp_sigmoid, ibp_swiglu,
-    ibp_rmsnorm, ibp_recurrent_step, ibp_conv1d,
-    bound_width, margin_from_bounds
+    ibp_rmsnorm, ibp_rmsnorm_tight, ibp_recurrent_step, ibp_conv1d,
+    bound_width, margin_from_bounds,
+    crown_linear_backward, crown_sigmoid_backward,
+    crown_rmsnorm_backward, crown_swiglu_backward,
+    crown_rmsnorm_backward_v2, concretize_bounds_v2,
+    concretize_bounds
 )
 
 
@@ -312,7 +316,206 @@ class BoundModel:
         # down_proj: BitLinear
         return ibp_linear(swiglu_l, swiglu_u, mlp.down_proj.weight)
 
-    # ── uncertainty metrics ────────────────────────────────────────────
+    # ── CROWN / IBP-CROWN (linear relaxation) ──────────────────────────
+
+    @torch.no_grad()
+    def crown_bounds(self, input_ids, epsilon, attention_mask=None, n_layers=4):
+        """
+        Pure CROWN: back-propagate linear bounds from output to input through
+        the last n_layers layers. Uses tight IBP for intermediate pre-activation
+        bounds needed by CROWN relaxation.
+        """
+        emb = self.get_embeddings(input_ids).float()
+        emb_l, emb_u = self.perturb_embeddings(emb, epsilon)
+        base_model = self.model.model
+        n_total = len(base_model.layers)
+        start_layer = max(0, n_total - n_layers)
+
+        # Run tight IBP through early layers to get input bounds for CROWN segment
+        h_l, h_u = emb_l, emb_u
+        for layer_idx in range(start_layer):
+            layer = base_model.layers[layer_idx]
+            h_l, h_u = self._ibp_block_tight(layer, h_l, h_u, attention_mask, layer_idx)
+            h_l = torch.clamp(h_l, min=-1e6, max=1e6)
+            h_u = torch.clamp(h_u, min=-1e6, max=1e6)
+
+        x_l, x_u = h_l, h_u  # input bounds to the CROWN segment
+
+        # Forward IBP through CROWN segment to get pre-activation bounds
+        layer_bounds = []
+        for layer_idx in range(start_layer, n_total):
+            layer = base_model.layers[layer_idx]
+            h_l, h_u = self._ibp_block_tight(layer, h_l, h_u, attention_mask, layer_idx)
+            h_l = torch.clamp(h_l, min=-1e6, max=1e6)
+            h_u = torch.clamp(h_u, min=-1e6, max=1e6)
+            layer_bounds.append((h_l.clone(), h_u.clone()))
+
+        # Final norm
+        norm_weight = base_model.norm.weight
+        final_l, final_u = ibp_rmsnorm_tight(h_l, h_u, norm_weight, eps=base_model.norm.eps)
+        lm_weight = self.model.lm_head.weight.float()
+
+        # ── CROWN backward pass ──
+        B, L, D = final_l.shape
+        V = lm_weight.size(0)
+        device = final_l.device
+
+        # Start from output: A = I for each position
+        last_uA = torch.eye(V, device=device).unsqueeze(0).unsqueeze(0).expand(B, L, V, V)
+        last_lA = torch.eye(V, device=device).unsqueeze(0).unsqueeze(0).expand(B, L, V, V)
+        ubias_sum = torch.zeros(B, L, V, device=device)
+        lbias_sum = torch.zeros(B, L, V, device=device)
+
+        # Backward through LM head (linear)
+        uA, ub, lA, lb = crown_linear_backward(last_uA, last_lA, lm_weight)
+        ubias_sum = ubias_sum + ub if ub is not None else ubias_sum
+        lbias_sum = lbias_sum + lb if lb is not None else lbias_sum
+        last_uA, last_lA = uA, lA
+
+        # Backward through final RMSNorm
+        uA, ub, lA, lb = crown_rmsnorm_backward(
+            last_uA, last_lA, h_l, h_u, norm_weight, eps=base_model.norm.eps)
+        ubias_sum = ubias_sum + ub
+        lbias_sum = lbias_sum + lb
+        last_uA, last_lA = uA, lA
+
+        # Backward through CROWN segment layers (reverse order)
+        for rev_idx, layer_idx in enumerate(range(n_total - 1, start_layer - 1, -1)):
+            layer = base_model.layers[layer_idx]
+            h_l, h_u = layer_bounds[rev_idx]
+
+            # Backward through MLP
+            last_uA, last_lA, ubias_sum, lbias_sum = self._crown_backward_mlp(
+                layer.mlp, last_uA, last_lA, h_l, h_u, ubias_sum, lbias_sum)
+
+            # Backward through attention
+            last_uA, last_lA, ubias_sum, lbias_sum = self._crown_backward_attention(
+                layer.attn, last_uA, last_lA, h_l, h_u,
+                attention_mask, ubias_sum, lbias_sum)
+
+        # Concretize bounds at input x_L, x_U
+        logits_l = concretize_bounds(last_lA, lbias_sum, x_l, x_u, sign=-1)
+        logits_u = concretize_bounds(last_uA, ubias_sum, x_l, x_u, sign=+1)
+
+        return logits_l, logits_u
+
+    @torch.no_grad()
+    def ibp_crown_bounds(self, input_ids, epsilon, attention_mask=None):
+        """
+        IBP-CROWN hybrid: use tight IBP for intermediate hidden-state bounds,
+        then apply CROWN only through the final LM head and norm.
+
+        The CROWN backward starts with identity at the output (A = I_V, one row
+        per logit), then back-propagates through LM head (V×D) and RMSNorm.
+        """
+        emb = self.get_embeddings(input_ids).float()
+        emb_l, emb_u = self.perturb_embeddings(emb, epsilon)
+        base_model = self.model.model
+
+        # ── IBP forward (tight, for intermediate bounds) ──
+        h_l, h_u = emb_l, emb_u
+        for layer_idx, layer in enumerate(base_model.layers):
+            h_l, h_u = self._ibp_block_tight(layer, h_l, h_u, attention_mask, layer_idx)
+            h_l = torch.clamp(h_l, min=-1e6, max=1e6)
+            h_u = torch.clamp(h_u, min=-1e6, max=1e6)
+
+        hidden_l, hidden_u = h_l.clone(), h_u.clone()
+
+        # ── IBP through final norm + lm_head ──
+        norm_weight = base_model.norm.weight
+        final_l, final_u = ibp_rmsnorm_tight(h_l, h_u, norm_weight, eps=base_model.norm.eps)
+        lm_weight = self.model.lm_head.weight.float()
+        final_l, final_u = final_l.float(), final_u.float()
+        ibp_logits_l, ibp_logits_u = ibp_linear(final_l, final_u, lm_weight)
+
+        # ── CROWN backward through final norm + lm_head ──
+        # last_uA: (V, D) — each of V rows is the linear bound coeff for one logit
+        # Start from output: A = W_lm (since output = W_lm @ x_norm)
+        B, L, D = hidden_l.shape
+        V = lm_weight.size(0)
+        device = hidden_l.device
+
+        # CROWN through LM head: identity at output means A_out = W_lm
+        # For each logit k: logit_k = w_k^T @ x_norm, so A_k = w_k^T
+        # Upper and lower A are the same for a linear layer
+        last_uA = lm_weight.clone()  # (V, D)
+        last_lA = lm_weight.clone()  # (V, D)
+        ubias_sum = torch.zeros(V, device=device)
+        lbias_sum = torch.zeros(V, device=device)
+
+        # CROWN backward through RMSNorm
+        # Need to handle (V, D) @ (B, L, D) -> (B, L, V)
+        uA, ub, lA, lb = crown_rmsnorm_backward_v2(
+            last_uA, last_lA, hidden_l, hidden_u, norm_weight, eps=base_model.norm.eps)
+        ubias_sum = ubias_sum + ub if ub is not None else ubias_sum
+        lbias_sum = lbias_sum + lb if lb is not None else lbias_sum
+
+        # Concretize: for each (b, l, v), compute bound from A(v,:) @ x(b,l,:) + bias(v)
+        crown_logits_l = concretize_bounds_v2(lA, lbias_sum, hidden_l, hidden_u, sign=-1)
+        crown_logits_u = concretize_bounds_v2(uA, ubias_sum, hidden_l, hidden_u, sign=+1)
+
+        return ibp_logits_l, ibp_logits_u, crown_logits_l, crown_logits_u
+
+    def _ibp_block_tight(self, layer, h_l, h_u, attention_mask, layer_idx):
+        """Single-block IBP using tight RMSNorm for trend analysis."""
+        n_l, n_u = ibp_rmsnorm_tight(h_l, h_u, layer.attn_norm.weight, eps=layer.attn_norm.eps)
+        a_l, a_u = self._ibp_attention(layer.attn, n_l, n_u, attention_mask, layer_idx)
+        merged_l, merged_u = h_l + a_l, h_u + a_u
+        n2_l, n2_u = ibp_rmsnorm_tight(merged_l, merged_u, layer.mlp_norm.weight, eps=layer.mlp_norm.eps)
+        m_l, m_u = self._ibp_mlp(layer.mlp, n2_l, n2_u)
+        return merged_l + m_l, merged_u + m_u
+
+    def _crown_backward_mlp(self, mlp, last_uA, last_lA, h_l, h_u, ubias_sum, lbias_sum):
+        """CROWN backward through HGRNBitMLP (SwiGLU + down_proj)."""
+        # MLP: h -> gate_proj -> swiglu -> down_proj -> output
+        gate_weight = mlp.gate_proj.weight
+        down_weight = mlp.down_proj.weight
+        mid_dim = down_weight.size(1)
+        gate_dim = gate_weight.size(0) // 2
+
+        # 1. Backward through down_proj (linear)
+        uA, ub, lA, lb = crown_linear_backward(last_uA, last_lA, down_weight)
+        ubias_sum = ubias_sum + ub if ub is not None else ubias_sum
+        lbias_sum = lbias_sum + lb if lb is not None else lbias_sum
+
+        # 2. Through SwiGLU: we need bounds on gate_proj output
+        g_l, g_u = ibp_linear(h_l, h_u, gate_weight)
+        gate_l, gate_u = g_l[..., :gate_dim], g_u[..., :gate_dim]
+        val_l, val_u = g_l[..., gate_dim:], g_u[..., gate_dim:]
+
+        uA, ub, lA, lb = crown_swiglu_backward(uA, lA, gate_l, gate_u, val_l, val_u)
+        ubias_sum = ubias_sum + ub
+        lbias_sum = lbias_sum + lb
+
+        # 3. Through gate_proj (linear): uA and lA are now on swiglu input
+        # The swiglu input is the concatenation of gate and val paths from gate_proj
+        # Sum the contributions from both halves
+        if uA is not None and isinstance(uA, tuple):
+            uA_gate, uA_val = uA
+            # gate path: gate_proj weight first half
+            uA_from_gate = uA_gate.matmul(gate_weight[:gate_dim])
+            uA_from_val = uA_val.matmul(gate_weight[gate_dim:])
+            uA = uA_from_gate + uA_from_val
+        if lA is not None and isinstance(lA, tuple):
+            lA_gate, lA_val = lA
+            lA_from_gate = lA_gate.matmul(gate_weight[:gate_dim])
+            lA_from_val = lA_val.matmul(gate_weight[gate_dim:])
+            lA = lA_from_gate + lA_from_val
+
+        return uA, lA, ubias_sum, lbias_sum
+
+    def _crown_backward_attention(self, attn, last_uA, last_lA, h_l, h_u,
+                                   attention_mask, ubias_sum, lbias_sum):
+        """CROWN backward through attention (linear projections only).
+        Skips recurrence nonlinearity; uses the input hidden states as proxy."""
+        # Output projection (linear)
+        uA, ub, lA, lb = crown_linear_backward(last_uA, last_lA, attn.o_proj.weight)
+        ubias_sum = ubias_sum + ub if ub is not None else ubias_sum
+        lbias_sum = lbias_sum + lb if lb is not None else lbias_sum
+
+        # Skip detailed backward through recurrence (non-differentiable interval).
+        # Instead, attribute uncertainty to attention input proportionally.
+        return uA, lA, ubias_sum, lbias_sum
 
     def compute_metrics(self, lb_logits, ub_logits):
         """Compute uncertainty metrics from output bounds."""

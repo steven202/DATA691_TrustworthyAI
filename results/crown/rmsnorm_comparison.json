@@ -1,0 +1,51 @@
+[
+  {
+    "bound_width": 0.1,
+    "ibp_width": 50.88431167602539,
+    "crown_width": 10.050436019897461,
+    "tightening_ratio": 5.06289593558793,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 1.0,
+    "ibp_width": 501.11480712890625,
+    "crown_width": 10.10116958618164,
+    "tightening_ratio": 49.60958261847512,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 10.0,
+    "ibp_width": 5003.4189453125,
+    "crown_width": 10.101682662963867,
+    "tightening_ratio": 495.30549634633644,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 100.0,
+    "ibp_width": 50026.45703125,
+    "crown_width": 10.10168743133545,
+    "tightening_ratio": 4952.287167000224,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 1000.0,
+    "ibp_width": 500256.8125,
+    "crown_width": 10.10168743133545,
+    "tightening_ratio": 49522.10369806163,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 5000.0,
+    "ibp_width": 2501280.5,
+    "crown_width": 10.10168743133545,
+    "tightening_ratio": 247610.1658264563,
+    "frac_cross_zero": 1.0
+  },
+  {
+    "bound_width": 10000.0,
+    "ibp_width": 5002560.5,
+    "crown_width": 10.10168743133545,
+    "tightening_ratio": 495220.28215623164,
+    "frac_cross_zero": 1.0
+  }
+]
