@@ -207,19 +207,19 @@ The MMfreeLM paper emphasizes the elimination of MatMul. However, eliminating Ma
 
 For IBP to succeed, a model needs a provably small global Lipschitz constant, which typically requires specialized certified training~\cite{gowal2018effectiveness,zhang2019towards}. Neither matmul-free nor standard Transformers have this property out of the box.
 
+\subsection{Key Quantitative Findings}
+
+Our experiments reveal a sharp dichotomy between certified and empirical approaches. Certified IBP produces output bounds up to 500,000$\times$ wider than CROWN linear relaxation on a single RMSNorm operation---the RMSNorm denominator collapses toward $\sqrt{\epsilon}$ when input bounds cross zero, while BitLinear layers (ternary accumulation) remain well-behaved. The CROWN diagonal-Jacobian implementation keeps RMSNorm bounds stable at $\sim$10 regardless of input range, yielding tightening ratios from $5\times$ to $5\times 10^5$.
+
+Monte Carlo sampling provides model-agnostic uncertainty estimates with bound widths of 0.5--10 across $\varepsilon \in [0.001, 0.1]$. Comparing MMfreeLM-370M against GPT-2 Medium (355M), we found that the matmul-free architecture does not fundamentally alter embedding-level robustness: at $\varepsilon{=}0.01$, MC bound widths are 0.89 vs.\ 1.98, with GPT-2 showing higher top-1 stability (0.99 vs.\ 0.59) despite wider bounds. The two-pass corner evaluation systematically underestimates uncertainty by 2--6$\times$ compared to MC, confirming that output extrema do not occur at input extrema for non-monotonic architectures.
+
 \subsection{Limitations}
 
 Our study has several limitations: (1) we perturb embeddings rather than discrete tokens, which is well-defined mathematically but may not correspond to realistic textual perturbations; (2) MC sampling with $K{=}50$ may miss rare extreme outputs accessible to an adversary; (3) our CROWN implementation uses a diagonal Jacobian approximation for RMSNorm---a full CROWN backward pass through the gated recurrence and SwiGLU activation would provide end-to-end certified bounds; (4) the baseline comparison is limited to one model pair (370M vs.\ 355M) and two architectures.
 
 \section{Conclusion}
 
-We presented a study of certified and sampling-based uncertainty quantification for matmul-free language models. Our first key finding is that certified IBP bounds explode due to RMSNorm---a data-dependent division operation that is fundamentally incompatible with interval arithmetic. When bounds are wide enough that dimensions cross zero, the RMSNorm denominator collapses toward $\sqrt{\epsilon}$, producing output bounds that are up to 500,000$\times$ wider than those obtained via linear relaxation. BitLinear layers, which use only ternary accumulation, are well-behaved under IBP; it is the normalization and multiplicative gating that cause the failure.
-
-Second, we demonstrated that CROWN linear relaxation provides a practical solution. Our diagonal-Jacobian CROWN implementation keeps RMSNorm bounds stable at $\sim$10 regardless of the input bound range, compared to certified IBP which scales linearly. This represents a tightening ratio of $5\times$ to $5\times 10^5$ depending on the bound width. A full IBP-CROWN implementation---using IBP for efficient intermediate bounds and CROWN for tight final bounds through the normalization layers---is the natural next step toward practical certified UQ for recurrent LLMs.
-
-Third, Monte Carlo sampling provides stable, model-agnostic uncertainty estimates with bound widths of 0.5--10 across $\varepsilon \in [0.001, 0.1]$. Comparing MMfreeLM-370M against GPT-2 Medium (355M), we found that the matmul-free architecture does not fundamentally alter embedding-level robustness: at $\varepsilon{=}0.01$, MC bound widths are 0.89 vs.\ 1.98, with GPT-2 showing higher top-1 stability (0.99 vs.\ 0.59) despite wider bounds. The two-pass corner evaluation systematically underestimates uncertainty by 2--6$\times$ compared to MC, confirming that output extrema do not occur at input extrema for non-monotonic architectures.
-
-All code is open-source and provides a reusable framework for bound propagation analysis of language models.
+This work examined whether matmul-free language models admit formal uncertainty quantification through bound propagation. We found that removing matrix multiplications does not make a model more amenable to certified verification---the primary bottleneck is RMSNorm, a division-based normalization that fundamentally conflicts with interval arithmetic. Linear relaxation methods such as CROWN resolve this by bounding the operation around a fixed midpoint, providing a path toward practical certified bounds for recurrent architectures. Empirical Monte Carlo sampling bridges the gap: it provides stable uncertainty estimates across model scales and architectures without requiring specialized certified training. Our open-source framework supports all three approaches and is designed for extension to deeper CROWN backward passes and larger model families.
 
 \bibliographystyle{plain}
 \bibliography{ref}
